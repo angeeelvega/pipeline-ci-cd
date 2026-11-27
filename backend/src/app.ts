@@ -4,7 +4,35 @@ import express, {
   type Request,
   type Response,
 } from "express";
-import { createTaskStore, isTaskStatus, type TaskStore } from "./tasks.js";
+import {
+  createBoard,
+  PRIORITIES,
+  STATUSES,
+  type Board,
+  type IssuePatch,
+  type IssueStatus,
+  type Member,
+  type Priority,
+} from "./board.js";
+
+type AuthedResponse = Response & { locals: { member?: Member } };
+
+const readCookie = (header: string | undefined, name: string): string => {
+  if (!header) return "";
+  const part = header
+    .split(";")
+    .map((item) => item.trim())
+    .find((item) => item.startsWith(`${name}=`));
+  return part ? decodeURIComponent(part.slice(name.length + 1)) : "";
+};
+
+const writeSession = (res: Response, token: string) => {
+  res.setHeader("Set-Cookie", `session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/`);
+};
+
+const clearSession = (res: Response) => {
+  res.setHeader("Set-Cookie", "session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+};
 
 const readObject = (body: unknown): Record<string, unknown> => {
   if (typeof body === "object" && body !== null && !Array.isArray(body)) {
@@ -13,13 +41,57 @@ const readObject = (body: unknown): Record<string, unknown> => {
   return {};
 };
 
-export const createApp = (store: TaskStore = createTaskStore()): Express => {
+const isStatus = (value: unknown): value is IssueStatus =>
+  typeof value === "string" && STATUSES.includes(value as IssueStatus);
+
+const isPriority = (value: unknown): value is Priority =>
+  typeof value === "string" && PRIORITIES.includes(value as Priority);
+
+const readPatch = (body: unknown): IssuePatch | { error: string } => {
+  const source = readObject(body);
+  const patch: IssuePatch = {};
+
+  if ("title" in source) {
+    if (typeof source.title !== "string") return { error: "El título es obligatorio" };
+    patch.title = source.title;
+  }
+  if ("description" in source) {
+    if (typeof source.description !== "string") return { error: "La descripción no es válida" };
+    patch.description = source.description;
+  }
+  if ("status" in source) {
+    if (!isStatus(source.status)) return { error: "El estado no es válido" };
+    patch.status = source.status;
+  }
+  if ("priority" in source) {
+    if (!isPriority(source.priority)) return { error: "La prioridad no es válida" };
+    patch.priority = source.priority;
+  }
+  if ("labelIds" in source) {
+    if (!Array.isArray(source.labelIds) || source.labelIds.some((id) => typeof id !== "string")) {
+      return { error: "Las etiquetas no son válidas" };
+    }
+    patch.labelIds = source.labelIds;
+  }
+  if ("assigneeId" in source) {
+    if (source.assigneeId !== null && typeof source.assigneeId !== "string") {
+      return { error: "Ese responsable no existe" };
+    }
+    patch.assigneeId = source.assigneeId;
+  }
+
+  return patch;
+};
+
+export const createApp = (board: Board = createBoard()): Express => {
+  const sessions = new Map<string, string>();
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "32kb" }));
 
   app.use((req, res, next) => {
-    res.setHeader("Access-Control-Allow-Origin", process.env.CORS_ORIGIN ?? "*");
+    res.setHeader("Access-Control-Allow-Origin", process.env.CORS_ORIGIN ?? "http://localhost:5173");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
     if (req.method === "OPTIONS") {
@@ -29,61 +101,110 @@ export const createApp = (store: TaskStore = createTaskStore()): Express => {
     next();
   });
 
-  app.get("/", (_req, res) => {
-    res.json({
-      name: "pipeline-api",
-      health: "/health",
-      tasks: "/api/tasks",
-    });
-  });
+  const requireMember = (req: Request, res: AuthedResponse, next: NextFunction) => {
+    const memberId = sessions.get(readCookie(req.headers.cookie, "session"));
+    const member = board.listMembers().find((item) => item.id === memberId);
+    if (!member) {
+      res.status(401).json({ error: "Inicia sesión" });
+      return;
+    }
+    res.locals.member = member;
+    next();
+  };
 
   app.get("/health", (_req, res) => {
     res.json({ status: "ok" });
   });
 
-  app.get("/api/tasks", (_req, res) => {
-    res.json({ tasks: store.list() });
+  app.post("/api/session", (req, res) => {
+    const body = readObject(req.body);
+    if (typeof body.email !== "string" || typeof body.password !== "string") {
+      res.status(400).json({ error: "Correo o contraseña incorrectos" });
+      return;
+    }
+    const member = board.authenticate(body.email, body.password);
+    if (!member) {
+      res.status(401).json({ error: "Correo o contraseña incorrectos" });
+      return;
+    }
+    const token = crypto.randomUUID();
+    sessions.set(token, member.id);
+    writeSession(res, token);
+    res.json({ user: member });
   });
 
-  app.post("/api/tasks", (req, res) => {
-    const title = readObject(req.body).title;
-    if (typeof title !== "string") {
+  app.get("/api/session", requireMember, (_req, res: AuthedResponse) => {
+    res.json({ user: res.locals.member });
+  });
+
+  app.delete("/api/session", (req, res) => {
+    const token = readCookie(req.headers.cookie, "session");
+    if (token) sessions.delete(token);
+    clearSession(res);
+    res.status(204).send();
+  });
+
+  app.get("/api/board", requireMember, (_req, res) => {
+    res.json({
+      issues: board.listIssues(),
+      labels: board.listLabels(),
+      members: board.listMembers(),
+    });
+  });
+
+  app.get("/api/issues/:key", requireMember, (req, res) => {
+    const issue = board.findIssue(req.params.key);
+    if (!issue) {
+      res.status(404).json({ error: "No existe ese issue" });
+      return;
+    }
+    const comments = board.listComments(issue.key);
+    res.json({ issue, comments });
+  });
+
+  app.post("/api/issues", requireMember, (req, res) => {
+    const body = readObject(req.body);
+    if (typeof body.title !== "string") {
       res.status(400).json({ error: "El título es obligatorio" });
       return;
     }
-
-    const result = store.create(title);
-    if ("error" in result) {
-      res.status(400).json(result);
+    const description = typeof body.description === "string" ? body.description : "";
+    const created = board.createIssue(body.title, description);
+    if ("error" in created) {
+      res.status(400).json(created);
       return;
     }
-
-    res.status(201).json({ task: result });
+    res.status(201).json({ issue: created });
   });
 
-  app.patch("/api/tasks/:id", (req, res) => {
-    const status = readObject(req.body).status;
-    if (typeof status !== "string" || !isTaskStatus(status)) {
-      res.status(400).json({ error: "El estado tiene que ser todo, doing o done" });
+  app.patch("/api/issues/:key", requireMember, (req, res) => {
+    const patch = readPatch(req.body);
+    if ("error" in patch) {
+      res.status(400).json(patch);
       return;
     }
-
-    const result = store.updateStatus(req.params.id, status);
-    if ("error" in result) {
-      res.status(404).json(result);
+    const updated = board.updateIssue(req.params.key, patch);
+    if ("error" in updated) {
+      const status = updated.error === "No existe ese issue" ? 404 : 400;
+      res.status(status).json(updated);
       return;
     }
-
-    res.json({ task: result });
+    res.json({ issue: updated });
   });
 
-  app.delete("/api/tasks/:id", (req, res) => {
-    const removed = store.remove(req.params.id);
-    if (!removed) {
-      res.status(404).json({ error: "No existe esa tarea" });
+  app.post("/api/issues/:key/comments", requireMember, (req, res: AuthedResponse) => {
+    const body = readObject(req.body);
+    if (typeof body.body !== "string") {
+      res.status(400).json({ error: "El comentario es obligatorio" });
       return;
     }
-    res.status(204).send();
+    const comment = board.addComment(req.params.key, res.locals.member!.id, body.body);
+    if ("error" in comment) {
+      const status = comment.error === "No existe ese issue" ? 404 : 400;
+      res.status(status).json(comment);
+      return;
+    }
+    res.status(201).json({ comment });
   });
 
   app.use((error: unknown, _req: Request, res: Response, next: NextFunction) => {

@@ -1,48 +1,66 @@
-import type { Task, TaskStatus } from "./types";
+import type { Comment, Issue, IssuePatch, Label, Member } from "./types";
 
-type TasksResponse = { tasks: Task[] };
-type TaskResponse = { task: Task };
-type ErrorResponse = { error?: string };
+type ErrorBody = { error?: string };
 
 const readError = async (response: Response): Promise<string> => {
   try {
-    const body = (await response.json()) as ErrorResponse;
+    const body = (await response.json()) as ErrorBody;
     return body.error ?? "No se pudo completar la acción";
   } catch {
     return "No se pudo completar la acción";
   }
 };
 
-export const fetchTasks = async (): Promise<Task[]> => {
-  const response = await fetch("/api/tasks");
+const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
+  const response = await fetch(path, {
+    ...init,
+    credentials: "include",
+    headers: {
+      ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      ...init?.headers,
+    },
+  });
   if (!response.ok) throw new Error(await readError(response));
-  const body = (await response.json()) as TasksResponse;
-  return body.tasks;
+  if (response.status === 204) return undefined as T;
+  return (await response.json()) as T;
 };
 
-export const createTask = async (title: string): Promise<Task> => {
-  const response = await fetch("/api/tasks", {
+export const fetchSession = async (): Promise<Member | null> => {
+  const response = await fetch("/api/session", { credentials: "include" });
+  if (response.status === 401) return null;
+  if (!response.ok) throw new Error(await readError(response));
+  const body = (await response.json()) as { user: Member };
+  return body.user;
+};
+
+export const login = (email: string, password: string) =>
+  request<{ user: Member }>("/api/session", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title }),
+    body: JSON.stringify({ email, password }),
   });
-  if (!response.ok) throw new Error(await readError(response));
-  const body = (await response.json()) as TaskResponse;
-  return body.task;
-};
 
-export const updateTaskStatus = async (id: string, status: TaskStatus): Promise<Task> => {
-  const response = await fetch(`/api/tasks/${id}`, {
+export const logout = () => request<void>("/api/session", { method: "DELETE" });
+
+export const fetchBoard = () =>
+  request<{ issues: Issue[]; labels: Label[]; members: Member[] }>("/api/board");
+
+export const fetchIssue = (key: string) =>
+  request<{ issue: Issue; comments: Comment[] }>(`/api/issues/${key}`);
+
+export const createIssue = (title: string, description: string) =>
+  request<{ issue: Issue }>("/api/issues", {
+    method: "POST",
+    body: JSON.stringify({ title, description }),
+  });
+
+export const updateIssue = (key: string, patch: IssuePatch) =>
+  request<{ issue: Issue }>(`/api/issues/${key}`, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ status }),
+    body: JSON.stringify(patch),
   });
-  if (!response.ok) throw new Error(await readError(response));
-  const body = (await response.json()) as TaskResponse;
-  return body.task;
-};
 
-export const deleteTask = async (id: string): Promise<void> => {
-  const response = await fetch(`/api/tasks/${id}`, { method: "DELETE" });
-  if (!response.ok) throw new Error(await readError(response));
-};
+export const addComment = (key: string, body: string) =>
+  request<{ comment: Comment }>(`/api/issues/${key}/comments`, {
+    method: "POST",
+    body: JSON.stringify({ body }),
+  });
